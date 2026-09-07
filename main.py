@@ -1,395 +1,392 @@
-# -*- coding: utf-8 -*-
-"""
-ربات پیگیری وام (Telegram Loan Tracker)
-----------------------------------------
-معماری:
-- از python-telegram-bot نسخه 21 استفاده می‌کنیم.
-- چون روی Railway باید هم وب‌هوک تلگرام و هم یک اندپوینت اضافه (/cron) را سرو کنیم،
-  از run_webhook با یک aiohttp WebApp سفارشی استفاده می‌کنیم:
-    * روت POST /webhook/<TOKEN>  -> آپدیت‌های تلگرام را به application.process_update می‌دهد
-    * روت GET/POST /cron?secret=... -> بررسی اقساط نزدیک و ارسال یادآوری
-- چرا run_webhook و نه Flask جدا؟ چون run_webhook خودش وب‌سرور aiohttp را بالا می‌آورد،
-  setWebhook را صدا می‌زند و به‌صورت async آپدیت‌ها را پردازش می‌کند؛ با اضافه کردن روت‌های
-  سفارشی به همان وب‌اپ، هر دو نیاز (وب‌هوک + cron) با یک پروسه حل می‌شود.
-"""
-
-import os
+import asyncio
 import logging
-from datetime import date, datetime, timedelta
+import os
+from datetime import datetime
 
 from aiohttp import web
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
-    CommandHandler,
     CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
+    CommandHandler,
     ContextTypes,
+    ConversationHandler,
+    MessageHandler,
     filters,
 )
 
-import db
-
-# ---------- تنظیمات از متغیرهای محیطی ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-AUTHORIZED_CHAT_ID = os.environ.get("AUTHORIZED_CHAT_ID", "")
-CRON_SECRET = os.environ.get("CRON_SECRET", "")
-RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL", "")
-PORT = int(os.environ.get("PORT", "8080"))
-WEBHOOK_PATH = "/webhook"
+from db import (
+    add_loan,
+    delete_loan,
+    get_active_loans,
+    get_loan_by_id,
+    get_settled_loans,
+    settle_loan,
+    update_loan_note,
+)
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger("loan_bot")
+logger = logging.getLogger(__name__)
+
+# ── env vars ────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+AUTHORIZED_CHAT_ID = int(os.environ["AUTHORIZED_CHAT_ID"])
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+RAILWAY_PUBLIC_URL = os.environ.get("RAILWAY_PUBLIC_URL", "").rstrip("/")
+
+# ── conversation states ──────────────────────────────────────────────────────
+(
+    ASK_BORROWER,
+    ASK_AMOUNT,
+    ASK_DESC,
+    ASK_SETTLE_CONFIRM,
+    ASK_DELETE_CONFIRM,
+    ASK_NOTE,
+) = range(6)
 
 
-# ---------- ابزارها ----------
-def fmt_amount(n: int) -> str:
-    """نمایش مبلغ با جداکننده هزارگان."""
-    return f"{int(n):,}"
-
-def authorized(update: Update) -> bool:
-    """بررسی مجاز بودن chat_id."""
-    if not AUTHORIZED_CHAT_ID:
-        return False
-    chat = update.effective_chat
-    return chat is not None and str(chat.id) == AUTHORIZED_CHAT_ID
-
-async def deny(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """پاسخ برای کاربر غیرمجاز."""
-    q = update.callback_query
-    if q:
-        await q.answer("دسترسی غیرمجاز", show_alert=True)
-    else:
-        await update.effective_message.reply_text("دسترسی غیرمجاز")
-
+# ── helpers ──────────────────────────────────────────────────────────────────
 def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        [InlineKeyboardButton("➕ ثبت وام جدید", callback_data="new_loan")][0],
-    ] + [
-        [InlineKeyboardButton("📋 وام‌های در حال پرداخت", callback_data="list_active")],
-        [InlineKeyboardButton("✅ وام‌های تسویه‌شده", callback_data="list_settled")],
-    ]])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("➕ وام جدید", callback_data="new_loan"),
+                InlineKeyboardButton("📋 وام‌های فعال", callback_data="list_active"),
+            ],
+            [
+                InlineKeyboardButton("✅ وام‌های تسویه‌شده", callback_data="list_settled"),
+            ],
+        ]
+    )
 
-def back_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="menu")]])
 
-# ---------- مراحل مکالمه ثبت وام ----------
-(ASK_NAME, ASK_AMOUNT, ASK_COUNT, ASK_DATE) = range(4)
+def auth(func):
+    """Decorator: only allow AUTHORIZED_CHAT_ID."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = (
+            update.effective_user.id
+            if update.effective_user
+            else None
+        )
+        if uid != AUTHORIZED_CHAT_ID:
+            if update.message:
+                await update.message.reply_text("⛔ دسترسی غیرمجاز.")
+            return
+        return await func(update, context)
+    return wrapper
 
-async def cb_new_loan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع ثبت وام جدید."""
-    q = update.callback_query
-    await q.answer()
-    context.user_data.clear()
-    await q.edit_message_text("📝 نام وام را وارد کنید (مثلاً: وام خودرو):")
-    return ASK_NAME
 
-async def ask_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
+# ── /start ───────────────────────────────────────────────────────────────────
+@auth
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "سلام! ربات مدیریت وام آماده است.",
+        reply_markup=main_menu_kb(),
+    )
+
+
+# ── main menu callback ────────────────────────────────────────────────────────
+@auth
+async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "new_loan":
+        await query.edit_message_text("نام وام‌گیرنده را وارد کنید:")
+        return ASK_BORROWER
+
+    if data == "list_active":
+        loans = await get_active_loans()
+        if not loans:
+            await query.edit_message_text(
+                "هیچ وام فعالی وجود ندارد.", reply_markup=main_menu_kb()
+            )
+            return ConversationHandler.END
+        rows = [
+            [
+                InlineKeyboardButton(
+                    f"#{loan['id']} — {loan['borrower']} — {loan['amount']:,} تومان",
+                    callback_data=f"loan_{loan['id']}",
+                )
+            ]
+            for loan in loans
+        ]
+        rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back")])
+        await query.edit_message_text(
+            "وام‌های فعال:", reply_markup=InlineKeyboardMarkup(rows)
+        )
         return ConversationHandler.END
-    context.user_data["loan_name"] = update.message.text.strip()[:100]
-    await update.message.reply_text("💰 مبلغ کل وام (تومان) را وارد کنید، مثلاً: 120000000")
+
+    if data == "list_settled":
+        loans = await get_settled_loans()
+        if not loans:
+            await query.edit_message_text(
+                "هیچ وام تسویه‌شده‌ای وجود ندارد.", reply_markup=main_menu_kb()
+            )
+            return ConversationHandler.END
+        rows = [
+            [
+                InlineKeyboardButton(
+                    f"#{loan['id']} — {loan['borrower']} — {loan['amount']:,} تومان",
+                    callback_data=f"loan_{loan['id']}",
+                )
+            ]
+            for loan in loans
+        ]
+        rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="back")])
+        await query.edit_message_text(
+            "وام‌های تسویه‌شده:", reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return ConversationHandler.END
+
+    if data == "back":
+        await query.edit_message_text("منوی اصلی:", reply_markup=main_menu_kb())
+        return ConversationHandler.END
+
+    # single loan view
+    if data.startswith("loan_"):
+        loan_id = int(data.split("_")[1])
+        loan = await get_loan_by_id(loan_id)
+        if not loan:
+            await query.edit_message_text("وام یافت نشد.", reply_markup=main_menu_kb())
+            return ConversationHandler.END
+        status = "تسویه‌شده" if loan["settled"] else "فعال"
+        text = (
+            f"🆔 شناسه: {loan['id']}\n"
+            f"👤 وام‌گیرنده: {loan['borrower']}\n"
+            f"💰 مبلغ: {loan['amount']:,} تومان\n"
+            f"📝 توضیح: {loan.get('description') or '—'}\n"
+            f"🗒 یادداشت: {loan.get('note') or '—'}\n"
+            f"📅 تاریخ: {loan['created_at'][:10]}\n"
+            f"📌 وضعیت: {status}"
+        )
+        buttons = []
+        if not loan["settled"]:
+            buttons.append(
+                InlineKeyboardButton("✅ تسویه", callback_data=f"settle_{loan_id}")
+            )
+        buttons.append(
+            InlineKeyboardButton("🗒 یادداشت", callback_data=f"note_{loan_id}")
+        )
+        buttons.append(
+            InlineKeyboardButton("🗑 حذف", callback_data=f"delete_{loan_id}")
+        )
+        kb = InlineKeyboardMarkup(
+            [buttons, [InlineKeyboardButton("🔙 بازگشت", callback_data="back")]]
+        )
+        await query.edit_message_text(text, reply_markup=kb)
+        context.user_data["current_loan_id"] = loan_id
+        return ConversationHandler.END
+
+    if data.startswith("settle_"):
+        loan_id = int(data.split("_")[1])
+        context.user_data["current_loan_id"] = loan_id
+        kb = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("بله", callback_data="settle_yes"),
+                InlineKeyboardButton("خیر", callback_data="settle_no"),
+            ]]
+        )
+        await query.edit_message_text("آیا از تسویه این وام مطمئن هستید؟", reply_markup=kb)
+        return ASK_SETTLE_CONFIRM
+
+    if data.startswith("delete_"):
+        loan_id = int(data.split("_")[1])
+        context.user_data["current_loan_id"] = loan_id
+        kb = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton("بله", callback_data="delete_yes"),
+                InlineKeyboardButton("خیر", callback_data="delete_no"),
+            ]]
+        )
+        await query.edit_message_text("آیا از حذف این وام مطمئن هستید؟", reply_markup=kb)
+        return ASK_DELETE_CONFIRM
+
+    if data.startswith("note_"):
+        loan_id = int(data.split("_")[1])
+        context.user_data["current_loan_id"] = loan_id
+        await query.edit_message_text("یادداشت جدید را وارد کنید:")
+        return ASK_NOTE
+
+    return ConversationHandler.END
+
+
+# ── new loan conversation ─────────────────────────────────────────────────────
+@auth
+async def ask_borrower(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["borrower"] = update.message.text.strip()
+    await update.message.reply_text("مبلغ وام را به تومان وارد کنید:")
     return ASK_AMOUNT
 
+
+@auth
 async def ask_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().replace(",", "").replace("،", "")
-    # تبدیل ارقام فارسی به انگلیسی
-    text = text.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
-    if not text.isdigit():
-        await update.message.reply_text("❌ لطفاً فقط عدد وارد کنید، مثلاً: 120000000")
+    raw = update.message.text.strip().replace(",", "").replace("،", "")
+    if not raw.isdigit():
+        await update.message.reply_text("لطفاً یک عدد صحیح وارد کنید:")
         return ASK_AMOUNT
-    context.user_data["loan_amount"] = int(text)
-    await update.message.reply_text("🔢 تعداد اقساط را وارد کنید:")
+    context.user_data["amount"] = int(raw)
+    await update.message.reply_text("توضیح کوتاه (یا /skip برای رد کردن):")
+    return ASK_DESC
 
-async def ask_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
-    if not text.isdigit() or int(text) < 1 or int(text) > 360:
-        await update.message.reply_text("❌ تعداد اقساط نامعتبر است. یک عدد بین ۱ تا ۳۶۰ وارد کنید:")
-        return ASK_COUNT
-    context.user_data["installments"] = int(text)
-    await update.message.reply_text(
-        "📅 تاریخ سررسید قسط اول را به فرمت YYYY-MM-DD وارد کنید (مثلاً 2025-07-01).\n"
-        "اقساط بعدی ماهانه و هم‌اندازه در نظر گرفته می‌شوند (باقیمانده در قسط آخر)."
-    )
-    return ASK_DATE
 
-async def ask_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
-    try:
-        first_due = datetime.strptime(text, "%Y-%m-%d").date()
-    except ValueError:
-        await update.message.reply_text("❌ فرمت تاریخ نامعتبر است. لطفاً به شکل YYYY-MM-DD وارد کنید:")
-        return ASK_DATE
-    name = context.user_data["loan_name"]
-    amount = context.user_data["loan_amount"]
-    count = context.user_data["installments"]
-    try:
-        loan = await db.create_loan(name, amount, count, first_due)
-    except Exception:
-        logger.exception("خطای دیتابیس در ایجاد وام")
-        await update.message.reply_text("⚠️ خطا در ذخیره‌سازی. دوباره تلاش کنید.")
-        return ConversationHandler.END
+@auth
+async def ask_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    context.user_data["description"] = "" if text == "/skip" else text
+    borrower = context.user_data["borrower"]
+    amount = context.user_data["amount"]
+    desc = context.user_data["description"]
+    loan = await add_loan(borrower, amount, desc)
     await update.message.reply_text(
-        f"✅ وام ثبت شد!\n\n"
-        f"نام: {name}\n"
-        f"مبلغ کل: {fmt_amount(amount)} تومان\n"
-        f"تعداد اقساط: {count}\n"
-        f"مبلغ هر قسط: {fmt_amount(amount // count)} تومان\n"
-        f"(قسط آخر: {fmt_amount(amount - (amount // count) * (count - 1))} تومان)\n"
-        f"سررسید اول: {first_due.isoformat()}",
-        reply_markup=back_menu_kb(),
+        f"وام #{loan['id']} برای {borrower} به مبلغ {amount:,} تومان ثبت شد.",
+        reply_markup=main_menu_kb(),
     )
     return ConversationHandler.END
 
+
+# ── settle conversation ───────────────────────────────────────────────────────
+@auth
+async def settle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    loan_id = context.user_data.get("current_loan_id")
+    if query.data == "settle_yes" and loan_id:
+        await settle_loan(loan_id)
+        await query.edit_message_text(
+            f"وام #{loan_id} تسویه شد.", reply_markup=main_menu_kb()
+        )
+    else:
+        await query.edit_message_text("لغو شد.", reply_markup=main_menu_kb())
+    return ConversationHandler.END
+
+
+# ── delete conversation ───────────────────────────────────────────────────────
+@auth
+async def delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    loan_id = context.user_data.get("current_loan_id")
+    if query.data == "delete_yes" and loan_id:
+        await delete_loan(loan_id)
+        await query.edit_message_text(
+            f"وام #{loan_id} حذف شد.", reply_markup=main_menu_kb()
+        )
+    else:
+        await query.edit_message_text("لغو شد.", reply_markup=main_menu_kb())
+    return ConversationHandler.END
+
+
+# ── note conversation ─────────────────────────────────────────────────────────
+@auth
+async def save_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    loan_id = context.user_data.get("current_loan_id")
+    note = update.message.text.strip()
+    if loan_id:
+        await update_loan_note(loan_id, note)
+        await update.message.reply_text(
+            f"یادداشت وام #{loan_id} ذخیره شد.", reply_markup=main_menu_kb()
+        )
+    return ConversationHandler.END
+
+
+# ── cancel ────────────────────────────────────────────────────────────────────
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.effective_message.reply_text("عملیات لغو شد.", reply_markup=main_menu_kb())
+    await update.message.reply_text("لغو شد.", reply_markup=main_menu_kb())
     return ConversationHandler.END
 
-# ---------- منو و لیست‌ها ----------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        await deny(update, context)
-        return
-    await update.message.reply_text(
-        "سلام! 👋\nبه ربات پیگیری وام خوش آمدید.", reply_markup=main_menu_kb()
+
+# ── build application ─────────────────────────────────────────────────────────
+def build_app() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(menu_handler),
+        ],
+        states={
+            ASK_BORROWER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_borrower)
+            ],
+            ASK_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ask_amount)
+            ],
+            ASK_DESC: [
+                MessageHandler(filters.TEXT, ask_desc)
+            ],
+            ASK_SETTLE_CONFIRM: [
+                CallbackQueryHandler(settle_confirm, pattern="^settle_(yes|no)$")
+            ],
+            ASK_DELETE_CONFIRM: [
+                CallbackQueryHandler(delete_confirm, pattern="^delete_(yes|no)$")
+            ],
+            ASK_NOTE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_note)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
     )
 
-async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.edit_message_text("منوی اصلی:", reply_markup=main_menu_kb())
+    app.add_handler(conv)
+    return app
 
-async def cb_list_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    try:
-        loans = await db.list_active_loans()
-    except Exception:
-        logger.exception("خطا در دریافت وام‌های فعال")
-        loans = []
-    if not loans:
-        await q.edit_message_text("وام فعالی وجود ندارد.", reply_markup=back_menu_kb())
-        return
-    kb = [[InlineKeyboardButton(f"{l['name']} ({l['id']})", callback_data=f"loan:{l['id']}")]
-          for l in loans]
-    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu")])
-    await q.edit_message_text("📋 وام‌های در حال پرداخت:", reply_markup=InlineKeyboardMarkup(kb))
 
-async def cb_list_settled(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    try:
-        loans = await db.list_settled_loans()
-    except Exception:
-        logger.exception("خطا در دریافت وام‌های تسویه‌شده")
-        loans = []
-    if not loans:
-        await q.edit_message_text("وام تسویه‌شده‌ای وجود ندارد.", reply_markup=back_menu_kb())
-        return
-    kb = [[InlineKeyboardButton(f"{l['name']} ({l['id']})", callback_data=f"loan:{l['id']}")]
-          for l in loans]
-    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu")])
-    await q.edit_message_text("✅ وام‌های تسویه‌شده:", reply_markup=InlineKeyboardMarkup(kb))
-
-def loan_detail_kb(loan: dict, installments: list) -> InlineKeyboardMarkup:
-    """ساخت کیبورد جزئیات وام + دکمه پرداخت برای اقساط در انتظار."""
-    kb = []
-    for ins in installments:
-        if ins["status"] == "pending":
-            kb.append([InlineKeyboardButton(
-                f"✅ پرداخت شد — قسط {ins['installment_no']} ({ins['due_date']})",
-                callback_data=f"pay:{loan['id']}:{ins['installment_no']}")])
-    kb.append([InlineKeyboardButton("🔙 بازگشت", callback_data="menu")])
-    return InlineKeyboardMarkup(kb)
-
-def loan_detail_text(loan: dict, installments: list) -> str:
-    paid_total = sum(i["amount"] for i in installments if i["status"] == "paid")
-    remaining = loan["total_amount"] - paid_total
-    next_due = next((i["due_date"] for i in installments if i["status"] == "pending"), None)
-    lines = [
-        f"📄 *{loan['name']}*",
-        f"مبلغ کل: {fmt_amount(loan['total_amount'])} تومان",
-        f"پرداخت‌شده: {fmt_amount(paid_total)} تومان",
-        f"باقیمانده: {fmt_amount(remaining)} تومان",
-        f"سررسید بعدی: {next_due if next_due else '—'}",
-        "",
-        "اقساط:",
-    ]
-    for i in installments:
-        emoji = "✅" if i["status"] == "paid" else "⏳"
-        lines.append(f"{emoji} قسط {i['installment_no']} — {i['due_date']} — {fmt_amount(i['amount'])} تومان")
-    return "\n".join(lines)
-
-async def cb_loan_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    loan_id = int(q.data.split(":")[1])
-    try:
-        loan = await db.get_loan_detail(loan_id)
-        if not loan:
-            await q.edit_message_text("وام یافت نشد.", reply_markup=back_menu_kb())
-            return
-        installments = loan.get("installments", [])
-    except Exception:
-        logger.exception("خطا در جزئیات وام")
-        await q.edit_message_text("⚠️ خطا در دریافت اطلاعات.", reply_markup=back_menu_kb())
-        return
-    text = loan_detail_text(loan, installments)
-    if loan["status"] == "settled":
-        await q.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_menu_kb())
-    else:
-        await q.edit_message_text(
-            text, parse_mode=ParseMode.MARKDOWN, reply_markup=loan_detail_kb(loan, installments)
-        )
-
-async def cb_pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """وقتی کاربر دکمه «✅ پرداخت شد» را برای یک قسط می‌زند."""
-    q = update.callback_query
-    if not authorized(update):
-        await q.answer("دسترسی غیرمجاز", show_alert=True)
-        return
-    await q.answer()
-
-    _, loan_id_s, no_s = q.data.split(":")
-    loan_id, installment_no = int(loan_id_s), int(no_s)
-
-    try:
-        await db.mark_installment_paid(loan_id, installment_no)
-        loan = await db.get_loan_detail(loan_id)
-    except Exception as e:
-        logger.exception("خطا در ثبت پرداخت قسط")
-        await q.edit_message_text(f"خطا در ثبت پرداخت: {e}")
-        return
-    if not loan:
-        await q.edit_message_text("وام یافت نشد.", reply_markup=back_menu_kb())
-        return
-
-    installments = loan.get("installments", [])
-    text = loan_detail_text(loan, installments)
-
-    if loan["status"] == "settled":
-        await q.edit_message_text(
-            text + "\n\n🎉 تبریک! این وام کاملاً تسویه شد!",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=back_menu_kb(),
-        )
-    else:
-        await q.edit_message_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=loan_detail_kb(loan, installments),
-        )
-
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> int:
-    """بررسی اقساط با سررسید حداکثر ۲ روز آینده و ارسال پیام یادآوری به کاربر مجاز."""
-    try:
-        upcoming = await db.get_upcoming_installments(days=2)
-    except Exception:
-        logger.exception("خطا در دریافت اقساط پیش‌رو برای یادآوری")
-        return 0
-
-    if not upcoming:
-        return 0
-
-    lines = ["🔔 یادآوری اقساط نزدیک به سررسید:\n"]
-    buttons = []
-    for inst in upcoming:
-        due = inst["due_date"]
-        amount = fmt_amount(inst["amount"])
-        loan_name = inst.get("loan_name", "")
-        no = inst.get("installment_no", "")
-        lines.append(f"• {loan_name} — قسط {no} — {amount} تومان — سررسید: {due}")
-        buttons.append([
-            InlineKeyboardButton(
-                f"✅ پرداخت شد ({loan_name} قسط {no})",
-                callback_data=f"pay:{inst['loan_id']}:{no}",
-            )
-        ])
-
-    text = "\n".join(lines)
-    try:
-        await context.bot.send_message(
-            chat_id=int(AUTHORIZED_CHAT_ID),
-            text=text,
-            reply_markup=InlineKeyboardMarkup(buttons),
-        )
-    except Exception:
-        logger.exception("خطا در ارسال پیام یادآوری")
-    return len(upcoming)
-
-async def cron_handler(request: web.Request) -> web.Response:
-    """اندپوینت HTTP که cron-job.org روزانه صدا می‌زند. محافظت با secret."""
-    secret = request.query.get("secret", "") or request.headers.get("X-Cron-Secret", "")
-    if not CRON_SECRET or secret != CRON_SECRET:
-        return web.json_response({"ok": False, "error": "unauthorized"}, status=401)
-    app: Application = request.app["ptb_app"]
-    sent = await send_reminder(app)
-    return web.json_response({"ok": True, "reminders_sent": sent})
-
+# ── webhook server ────────────────────────────────────────────────────────────
 async def webhook_handler(request: web.Request) -> web.Response:
-    """دریافت آپدیت تلگرام و ارسال به صف پردازش PTB."""
-    app: Application = request.app["ptb_app"]
+    # optional secret check
+    if WEBHOOK_SECRET:
+        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+            return web.Response(status=403)
+
+    app: Application = request.app["ptb"]
     data = await request.json()
     update = Update.de_json(data, app.bot)
     await app.process_update(update)
-    return web.Response(ok=True)
+    return web.Response(text="ok")
 
-# ---------- خطاها ----------
-async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("خطای پردازش آپدیت", exc_info=context.error)
 
-# ---------- ساخت اپلیکیشن ----------
-def build_app() -> Application:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+async def health(request: web.Request) -> web.Response:
+    return web.Response(text="ok")
 
-    conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cb_new_loan, pattern="^new_loan$")],
-        states={
-            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
-            ASK_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_amount)],
-            ASK_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_count)],
-            ASK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_date)],
-        },
-        fallbacks=[CommandHandler("start", lambda u, c: ConversationHandler.END)],
+
+async def main():
+    ptb_app = build_app()
+    await ptb_app.initialize()
+
+    # register webhook
+    webhook_url = f"{RAILWAY_PUBLIC_URL}/webhook"
+    await ptb_app.bot.set_webhook(
+        url=webhook_url,
+        secret_token=WEBHOOK_SECRET or None,
     )
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(cb_menu, pattern="^menu$"))
-    app.add_handler(CallbackQueryHandler(cb_list_active, pattern="^list_active$"))
-    app.add_handler(CallbackQueryHandler(cb_list_settled, pattern="^list_settled$"))
-    app.add_handler(CallbackQueryHandler(cb_loan_detail, pattern="^loan:\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_pay, pattern="^pay:\d+:\d+$"))
-    app.add_error_handler(on_error)
-    return app
+    logger.info("Webhook set to %s", webhook_url)
 
-def main():
-    """راه‌اندازی: وب‌هوک تلگرام + روت‌های سفارشی (cron) روی همان سرور aiohttp."""
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN تنظیم نشده است.")
-    app = build_app()
+    # aiohttp server
+    server = web.Application()
+    server["ptb"] = ptb_app
+    server.router.add_post("/webhook", webhook_handler)
+    server.router.add_get("/health", health)
 
-    async def on_startup(app: Application):
-        # افزودن روت‌های سفارشی به وب‌اپ داخلی PTB
-        webapp = app.webhook_app  # aiohttp web.Application ساخته‌شده توسط run_webhook
-        webapp.router.add_post(f"{WEBHOOK_PATH}/" + BOT_TOKEN, webhook_handler)
-        webapp.router.add_route("*", "/cron", cron_handler)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 8080)))
+    await site.start()
+    logger.info("Server listening on port %s", os.environ.get("PORT", 8080))
 
-    url = RAILWAY_PUBLIC_URL.rstrip("/") if RAILWAY_PUBLIC_URL else ""
-    webhook_url = f"{url}{WEBHOOK_PATH}/{BOT_TOKEN}"
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=f"{WEBHOOK_PATH}/{BOT_TOKEN}",
-        webhook_url=webhook_url,
-        secret_token=os.environ.get("WEBHOOK_SECRET", ""),
-    )
+    # keep alive
+    await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
