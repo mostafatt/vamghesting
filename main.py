@@ -38,7 +38,7 @@ AUTHORIZED_CHAT_ID = int(os.environ["AUTHORIZED_CHAT_ID"])
 
 
 def authorized(update: Update) -> bool:
-    return update.effective_chat.id == AUTHORIZED_CHAT_ID
+    return update.effective_chat and update.effective_chat.id == AUTHORIZED_CHAT_ID
 
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -46,13 +46,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
     await update.message.reply_text(
-        "سلام! به ربات مدیریت وام خوش آمدید.\n"
+        "سلام! به ربات مدیریت وام خوش آمدید.\n\n"
         "دستورات موجود:\n"
-        "/new_loan — ثبت وام جدید\n"
-        "/loans — لیست وام‌های فعال\n"
-        "/pay — ثبت قسط\n"
-        "/report — گزارش وام\n"
-        "/close_loan — بستن وام"
+        "➕ /new_loan — ثبت وام جدید\n"
+        "📋 /loans — لیست وام‌های فعال\n"
+        "💳 /pay — ثبت قسط\n"
+        "📊 /report — گزارش وام\n"
+        "🔒 /close_loan — بستن وام"
     )
 
 
@@ -73,9 +73,11 @@ async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         amount = float(update.message.text.replace(",", "").strip())
+        if amount <= 0:
+            raise ValueError
         context.user_data["amount"] = amount
     except ValueError:
-        await update.message.reply_text("مبلغ نامعتبر است. لطفاً عدد وارد کنید:")
+        await update.message.reply_text("مبلغ نامعتبر است. لطفاً عدد مثبت وارد کنید:")
         return AMOUNT
     await update.message.reply_text("نرخ بهره ماهانه (درصد) را وارد کنید (یا 0 برای بدون بهره):")
     return RATE
@@ -84,9 +86,11 @@ async def get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def get_rate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         rate = float(update.message.text.strip())
+        if rate < 0:
+            raise ValueError
         context.user_data["rate"] = rate
     except ValueError:
-        await update.message.reply_text("نرخ نامعتبر است. لطفاً عدد وارد کنید:")
+        await update.message.reply_text("نرخ نامعتبر است. لطفاً یک عدد معتبر (مثلاً 0 یا 2.5) وارد کنید:")
         return RATE
     await update.message.reply_text("تعداد اقساط ماهانه را وارد کنید:")
     return DURATION
@@ -101,29 +105,44 @@ async def get_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text("تعداد اقساط نامعتبر است. لطفاً عدد صحیح مثبت وارد کنید:")
         return DURATION
 
-    name = context.user_data["name"]
-    amount = context.user_data["amount"]
-    rate = context.user_data["rate"]
+    name = context.user_data.get("name")
+    amount = context.user_data.get("amount")
+    rate = context.user_data.get("rate")
 
-    # Calculate monthly installment
-    if rate > 0:
-        r = rate / 100
-        installment = amount * r * (1 + r) ** duration / ((1 + r) ** duration - 1)
-    else:
-        installment = amount / duration
+    if not name or amount is None or rate is None:
+        await update.message.reply_text("❌ اطلاعات ثبت وام منقضی شده است. لطفاً دستور /new_loan را مجدد اجرا کنید.")
+        context.user_data.clear()
+        return ConversationHandler.END
 
-    loan_id = await add_loan(name, amount, rate, duration, round(installment, 0))
+    try:
+        # محاسبه مبلغ هر قسط
+        if rate > 0:
+            r = rate / 100
+            installment = amount * r * ((1 + r) ** duration) / (((1 + r) ** duration) - 1)
+        else:
+            installment = amount / duration
 
-    await update.message.reply_text(
-        f"✅ وام با موفقیت ثبت شد.\n\n"
-        f"شناسه وام: {loan_id}\n"
-        f"وام‌گیرنده: {name}\n"
-        f"مبلغ: {amount:,.0f} تومان\n"
-        f"نرخ بهره: {rate}٪ ماهانه\n"
-        f"تعداد اقساط: {duration}\n"
-        f"مبلغ هر قسط: {installment:,.0f} تومان"
-    )
-    context.user_data.clear()
+        # ذخیره در دیتابیس
+        loan_id = await add_loan(name, amount, rate, duration, round(installment, 0))
+
+        await update.message.reply_text(
+            f"✅ وام با موفقیت ثبت شد.\n\n"
+            f"🔹 شناسه وام: {loan_id}\n"
+            f"👤 وام‌گیرنده: {name}\n"
+            f"💰 مبلغ: {amount:,.0f} تومان\n"
+            f"📈 نرخ بهره: {rate}٪ ماهانه\n"
+            f"🗓 تعداد اقساط: {duration} ماه\n"
+            f"💵 مبلغ هر قسط: {installment:,.0f} تومان"
+        )
+    except Exception as e:
+        logger.error(f"Error while saving loan: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ خطایی در ثبت وام در پایگاه داده رخ داد:\n`{e}`",
+            parse_mode="Markdown"
+        )
+    finally:
+        context.user_data.clear()
+
     return ConversationHandler.END
 
 
@@ -137,19 +156,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def list_loans(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
-    loans = await get_active_loans()
-    if not loans:
-        await update.message.reply_text("هیچ وام فعالی وجود ندارد.")
-        return
-    text = "📋 وام‌های فعال:\n\n"
-    for loan in loans:
-        text += (
-            f"🔹 شناسه: {loan['id']}\n"
-            f"   نام: {loan['borrower_name']}\n"
-            f"   مبلغ: {loan['amount']:,.0f} تومان\n"
-            f"   اقساط: {loan['paid_installments']}/{loan['duration']} پرداخت شده\n\n"
-        )
-    await update.message.reply_text(text)
+    try:
+        loans = await get_active_loans()
+        if not loans:
+            await update.message.reply_text("هیچ وام فعالی وجود ندارد.")
+            return
+        text = "📋 وام‌های فعال:\n\n"
+        for loan in loans:
+            text += (
+                f"🔹 شناسه: {loan['id']}\n"
+                f"   نام: {loan['borrower_name']}\n"
+                f"   مبلغ: {loan['amount']:,.0f} تومان\n"
+                f"   اقساط: {loan['paid_installments']}/{loan['duration']} پرداخت شده\n\n"
+            )
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.error(f"Error in list_loans: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ خطا در دریافت لیست وام‌ها: {e}")
 
 
 # ─── /pay ─────────────────────────────────────────────────────────────────────
@@ -157,25 +180,29 @@ async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not authorized(update):
         return
     args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("استفاده: /pay <loan_id> <amount>")
+    if not args or len(args) < 2:
+        await update.message.reply_text("استفاده صحیح: /pay <loan_id> <amount>\nمثال: `/pay 3 500000`", parse_mode="Markdown")
         return
     try:
         loan_id = int(args[0])
         amount = float(args[1].replace(",", ""))
     except ValueError:
-        await update.message.reply_text("ورودی نامعتبر. مثال: /pay 3 500000")
+        await update.message.reply_text("ورودی نامعتبر است. مثال: `/pay 3 500000`", parse_mode="Markdown")
         return
 
-    loan = await get_loan_by_id(loan_id)
-    if not loan:
-        await update.message.reply_text(f"وامی با شناسه {loan_id} یافت نشد.")
-        return
+    try:
+        loan = await get_loan_by_id(loan_id)
+        if not loan:
+            await update.message.reply_text(f"وامی با شناسه {loan_id} یافت نشد.")
+            return
 
-    await add_installment(loan_id, amount)
-    await update.message.reply_text(
-        f"✅ قسط {amount:,.0f} تومان برای وام {loan_id} ({loan['borrower_name']}) ثبت شد."
-    )
+        await add_installment(loan_id, amount)
+        await update.message.reply_text(
+            f"✅ قسط {amount:,.0f} تومان برای وام {loan_id} ({loan['borrower_name']}) ثبت شد."
+        )
+    except Exception as e:
+        logger.error(f"Error in pay: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ خطا در ثبت قسط: {e}")
 
 
 # ─── /report ──────────────────────────────────────────────────────────────────
@@ -192,33 +219,39 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("شناسه وام نامعتبر است.")
         return
 
-    loan = await get_loan_by_id(loan_id)
-    if not loan:
-        await update.message.reply_text(f"وامی با شناسه {loan_id} یافت نشد.")
-        return
+    try:
+        loan = await get_loan_by_id(loan_id)
+        if not loan:
+            await update.message.reply_text(f"وامی با شناسه {loan_id} یافت نشد.")
+            return
 
-    installments = await get_installments(loan_id)
-    total_paid = sum(i["amount"] for i in installments)
-    remaining = (loan["amount"] + loan.get("total_interest", 0)) - total_paid
+        installments = await get_installments(loan_id)
+        total_paid = sum(i["amount"] for i in installments)
+        total_payable = loan["installment_amount"] * loan["duration"]
+        remaining = max(0.0, total_payable - total_paid)
 
-    text = (
-        f"📊 گزارش وام {loan_id}\n\n"
-        f"وام‌گیرنده: {loan['borrower_name']}\n"
-        f"مبلغ اصلی: {loan['amount']:,.0f} تومان\n"
-        f"نرخ بهره: {loan['interest_rate']}٪\n"
-        f"تعداد اقساط: {loan['duration']}\n"
-        f"مبلغ هر قسط: {loan['installment_amount']:,.0f} تومان\n\n"
-        f"پرداخت‌ها:\n"
-    )
-    for i, inst in enumerate(installments, 1):
-        text += f"  {i}. {inst['amount']:,.0f} تومان — {inst['paid_at'][:10]}\n"
+        text = (
+            f"📊 گزارش وام {loan_id}\n\n"
+            f"وام‌گیرنده: {loan['borrower_name']}\n"
+            f"مبلغ اصلی: {loan['amount']:,.0f} تومان\n"
+            f"نرخ بهره: {loan['interest_rate']}٪\n"
+            f"تعداد اقساط: {loan['duration']}\n"
+            f"مبلغ هر قسط: {loan['installment_amount']:,.0f} تومان\n\n"
+            f"پرداخت‌ها:\n"
+        )
+        for i, inst in enumerate(installments, 1):
+            date_str = inst.get("paid_at", "")[:10]
+            text += f"  {i}. {inst['amount']:,.0f} تومان — {date_str}\n"
 
-    text += (
-        f"\nجمع پرداخت‌ها: {total_paid:,.0f} تومان\n"
-        f"باقی‌مانده: {remaining:,.0f} تومان\n"
-        f"وضعیت: {'بسته شده' if loan['status'] == 'closed' else 'فعال'}"
-    )
-    await update.message.reply_text(text)
+        text += (
+            f"\nجمع پرداخت‌ها: {total_paid:,.0f} تومان\n"
+            f"باقی‌مانده: {remaining:,.0f} تومان\n"
+            f"وضعیت: {'بسته شده' if loan['status'] == 'closed' else 'فعال'}"
+        )
+        await update.message.reply_text(text)
+    except Exception as e:
+        logger.error(f"Error in report: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ خطا در دریافت گزارش: {e}")
 
 
 # ─── /close_loan ──────────────────────────────────────────────────────────────
@@ -235,15 +268,19 @@ async def close_loan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("شناسه وام نامعتبر است.")
         return
 
-    loan = await get_loan_by_id(loan_id)
-    if not loan:
-        await update.message.reply_text(f"وامی با شناسه {loan_id} یافت نشد.")
-        return
+    try:
+        loan = await get_loan_by_id(loan_id)
+        if not loan:
+            await update.message.reply_text(f"وامی با شناسه {loan_id} یافت نشد.")
+            return
 
-    await close_loan(loan_id)
-    await update.message.reply_text(
-        f"✅ وام {loan_id} ({loan['borrower_name']}) بسته شد."
-    )
+        await close_loan(loan_id)
+        await update.message.reply_text(
+            f"✅ وام {loan_id} ({loan['borrower_name']}) با موفقیت بسته شد."
+        )
+    except Exception as e:
+        logger.error(f"Error in close_loan: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ خطا در بستن وام: {e}")
 
 
 # ─── Cron: send reminders for due loans ───────────────────────────────────────
@@ -264,6 +301,15 @@ async def send_due_reminders(bot) -> None:
             logger.error(f"Failed to send reminder for loan {loan['id']}: {e}")
 
 
+# ─── Global Error Handler ─────────────────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Exception while handling an update:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "⚠️ خطایی در اجرای درخواست رخ داد. لاگ سرور را بررسی کنید."
+        )
+
+
 # ─── aiohttp web app ───────────────────────────────────────────────────────────
 def build_web_app(application: Application) -> web.Application:
     web_app = web.Application()
@@ -275,7 +321,7 @@ def build_web_app(application: Application) -> web.Application:
             await application.process_update(update)
             return web.Response(status=200)
         except Exception as e:
-            logger.error(f"Webhook error: {e}")
+            logger.error(f"Webhook error: {e}", exc_info=True)
             return web.Response(status=500)
 
     async def cron_handler(request: web.Request) -> web.Response:
@@ -286,7 +332,7 @@ def build_web_app(application: Application) -> web.Application:
             await send_due_reminders(application.bot)
             return web.Response(status=200, text="OK")
         except Exception as e:
-            logger.error(f"Cron error: {e}")
+            logger.error(f"Cron error: {e}", exc_info=True)
             return web.Response(status=500)
 
     async def health_handler(request: web.Request) -> web.Response:
@@ -326,12 +372,15 @@ async def main() -> None:
     application.add_handler(CommandHandler("report", report))
     application.add_handler(CommandHandler("close_loan", close_loan_cmd))
 
-    # Initialize and set webhook
+    # ثبت هندلر خطای عمومی
+    application.add_error_handler(error_handler)
+
+    # راه‌اندازی و تنظیم وب‌هوک
     await application.initialize()
     await application.bot.set_webhook(url=f"{base_url}/webhook")
     await application.start()
 
-    # Start aiohttp server
+    # اجرای سرور aiohttp
     web_app = build_web_app(application)
     runner = web.AppRunner(web_app)
     await runner.setup()
