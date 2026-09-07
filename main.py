@@ -35,8 +35,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "سلام! به ربات مدیریت وام و اقساط خوش آمدید. 📊\n\n"
         "دستورات موجود:\n"
         "🔹 /new_loan - ثبت وام جدید\n"
-        "🔹 /loans - مشاهده لیست تمام وام‌ها\n"
-        "🔹 /installments <loan_id> - مشاهده و پرداخت اقساط یک وام\n"
+        "🔹 /loans یا /loan - مشاهده لیست وام‌ها\n"
+        "🔹 /installments <loan_id> - مشاهده و پرداخت اقساط وام\n"
         "🔹 /report <loan_id> - گزارش کامل یک وام\n"
         "🔹 /cancel - لغو عملیات جاری"
     )
@@ -97,7 +97,7 @@ async def get_total_inst(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💰 مبلغ کل: {total_amount:,.0f} تومان\n"
                 f"💵 مبلغ هر قسط: {inst_amount:,.0f} تومان\n"
                 f"🔢 تعداد اقساط: {count}\n\n"
-                f"برای مشاهده اقساط دستور زیر را بزنید:\n/installments {loan['id']}"
+                f"برای مشاهده اقساط روی دستور زیر بزنید:\n/installments_{loan['id']}"
             )
         else:
             await update.message.reply_text("❌ خطا در ثبت وام در دیتابیس.")
@@ -118,82 +118,142 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- لیست وام‌ها ----
 async def list_loans(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    loans = await get_loans_by_user(user_id)
+    try:
+        user_id = update.effective_user.id
+        loans = await get_loans_by_user(user_id)
 
-    if not loans:
-        await update.message.reply_text("شما هنوز هیچ وامی ثبت نکرده‌اید.")
-        return
+        if not loans:
+            await update.message.reply_text("شما هنوز هیچ وامی ثبت نکرده‌اید.\nبرای ثبت از /new_loan استفاده کنید.")
+            return
 
-    active_loans = [l for l in loans if l.get("status") != "settled"]
-    settled_loans = [l for l in loans if l.get("status") == "settled"]
+        active_loans = [l for l in loans if l.get("status") != "settled"]
+        settled_loans = [l for l in loans if l.get("status") == "settled"]
 
-    msg = "📋 **لیست وام‌های شما:**\n\n"
-    if active_loans:
-        msg += "⏳ **وام‌های جاری (تسویه‌نشده):**\n"
-        for l in active_loans:
-            rem = (l["total_installments"] - l["paid_installments"]) * l["installment_amount"]
-            msg += (
-                f"🔹 **وام #{l['id']} - {l['borrower_name']}**\n"
-                f"   مبلغ کل: {l['total_amount']:,.0f} | اقساط: {l['paid_installments']}/{l['total_installments']}\n"
-                f"   مانده: {rem:,.0f} تومان\n"
-                f"   مشاهده: /installments_{l['id']}\n\n"
-            )
+        msg = "📋 **لیست وام‌های شما:**\n\n"
+        if active_loans:
+            msg += "⏳ **وام‌های جاری (تسویه‌نشده):**\n"
+            for l in active_loans:
+                paid_cnt = l.get("paid_installments", 0)
+                tot_cnt = l.get("total_installments", 0)
+                inst_amt = l.get("installment_amount", 0)
+                tot_amt = l.get("total_amount", 0)
+                rem = (tot_cnt - paid_cnt) * inst_amt
 
-    if settled_loans:
-        msg += "✅ **وام‌های تسویه‌شده:**\n"
-        for l in settled_loans:
-            msg += f"✔ **وام #{l['id']} - {l['borrower_name']}** (کامل پرداخت شد)\n"
+                msg += (
+                    f"🔹 **وام #{l['id']} - {l.get('borrower_name', 'نامشخص')}**\n"
+                    f"   مبلغ کل: {tot_amt:,.0f} | اقساط: {paid_cnt}/{tot_cnt}\n"
+                    f"   مانده بدهی: {rem:,.0f} تومان\n"
+                    f"   مشاهده و پرداخت: /installments_{l['id']}\n"
+                    f"   گزارش وام: /report_{l['id']}\n\n"
+                )
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        if settled_loans:
+            msg += "✅ **وام‌های تسویه‌شده:**\n"
+            for l in settled_loans:
+                msg += f"✔ **وام #{l['id']} - {l.get('borrower_name', 'نامشخص')}** (کامل پرداخت شد)\n"
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in list_loans: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ خطا در دریافت اطلاعات وام‌ها: {str(e)}")
 
 
 # ---- مشاهده و پرداخت اقساط ----
 async def show_installments(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # گرفتن ID از دستور مثلاً /installments 5 یا /installments_5
-    text = update.message.text.strip()
-    loan_id = None
-    if "_" in text:
-        loan_id = text.split("_")[1]
-    elif context.args:
-        loan_id = context.args[0]
+    try:
+        text = update.message.text.strip()
+        loan_id = None
+        if "_" in text:
+            loan_id = text.split("_")[1]
+        elif context.args:
+            loan_id = context.args[0]
 
-    if not loan_id or not loan_id.isdigit():
-        await update.message.reply_text("لطفاً شناسه وام را وارد کنید. مثال: `/installments 1`", parse_mode="Markdown")
-        return
+        if not loan_id or not loan_id.isdigit():
+            await update.message.reply_text("لطفاً شناسه وام را وارد کنید. مثال: `/installments 1`", parse_mode="Markdown")
+            return
 
-    loan_id = int(loan_id)
-    loan = await get_loan_by_id(loan_id)
-    if not loan:
-        await update.message.reply_text("وامی با این شناسه یافت نشد.")
-        return
+        loan_id = int(loan_id)
+        loan = await get_loan_by_id(loan_id)
+        if not loan:
+            await update.message.reply_text("وامی با این شناسه یافت نشد.")
+            return
 
-    installments = await get_installments_by_loan(loan_id)
-    if not installments:
-        await update.message.reply_text("جدول اقساطی برای این وام یافت نشد.")
-        return
+        installments = await get_installments_by_loan(loan_id)
+        if not installments:
+            await update.message.reply_text("جدول اقساطی برای این وام یافت نشد.")
+            return
 
-    msg = f"📊 **اقساط وام #{loan_id} ({loan['borrower_name']}):**\n\n"
-    keyboard = []
+        msg = f"📊 **اقساط وام #{loan_id} ({loan['borrower_name']}):**\n\n"
+        keyboard = []
 
-    for inst in installments:
-        due = inst.get("due_date", "-")
-        amt = inst.get("amount", 0)
-        num = inst.get("number", 0)
+        for inst in installments:
+            due = inst.get("due_date", "-")
+            amt = inst.get("amount", 0)
+            num = inst.get("number", 0)
 
-        if inst.get("paid"):
-            msg += f"✅ قسط {num}: {amt:,.0f} تومان (سررسید: {due}) - پرداخت شده\n"
-        else:
-            msg += f"⏳ قسط {num}: {amt:,.0f} تومان (سررسید: {due}) - پرداخت نشده\n"
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"💳 پرداخت قسط {num} ({amt:,.0f} ت)",
-                    callback_data=f"pay:{inst['id']}:{loan_id}"
-                )
-            ])
+            if inst.get("paid"):
+                msg += f"✅ قسط {num}: {amt:,.0f} تومان (سررسید: {due}) - پرداخت شده\n"
+            else:
+                msg += f"⏳ قسط {num}: {amt:,.0f} تومان (سررسید: {due}) - پرداخت نشده\n"
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"💳 پرداخت قسط {num} ({amt:,.0f} ت)",
+                        callback_data=f"pay:{inst['id']}:{loan_id}"
+                    )
+                ])
 
-    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
-    await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        await update.message.reply_text(msg, reply_markup=reply_markup, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in show_installments: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ خطا: {str(e)}")
+
+
+# ---- گزارش کامل یک وام ----
+async def show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = update.message.text.strip()
+        loan_id = None
+        if "_" in text:
+            loan_id = text.split("_")[1]
+        elif context.args:
+            loan_id = context.args[0]
+
+        if not loan_id or not loan_id.isdigit():
+            await update.message.reply_text("لطفاً شناسه وام را وارد کنید. مثال: `/report 1`", parse_mode="Markdown")
+            return
+
+        loan_id = int(loan_id)
+        loan = await get_loan_by_id(loan_id)
+        if not loan:
+            await update.message.reply_text("وامی با این شناسه یافت نشد.")
+            return
+
+        installments = await get_installments_by_loan(loan_id)
+        total_inst = loan.get("total_installments", 0)
+        paid_inst = loan.get("paid_installments", 0)
+        inst_amt = loan.get("installment_amount", 0)
+        tot_amt = loan.get("total_amount", 0)
+        paid_amt = paid_inst * inst_amt
+        rem_amt = (total_inst - paid_inst) * inst_amt
+        status_txt = "✅ تسویه کامل" if loan.get("status") == "settled" else "⏳ در حال پرداخت"
+
+        report_msg = (
+            f"📑 **گزارش وضعیت وام #{loan['id']}**\n\n"
+            f"👤 **وام‌گیرنده:** {loan.get('borrower_name')}\n"
+            f"📌 **وضعیت:** {status_txt}\n"
+            f"💰 **مبلغ کل وام:** {tot_amt:,.0f} تومان\n"
+            f"💵 **مبلغ هر قسط:** {inst_amt:,.0f} تومان\n"
+            f"📊 **اقساط پرداخت شده:** {paid_inst} از {total_inst}\n"
+            f"🟢 **مجموع واریزی:** {paid_amt:,.0f} تومان\n"
+            f"🔴 **مانده بدهی:** {rem_amt:,.0f} تومان\n\n"
+            f"برای مشاهده جزئیات ریز اقساط: /installments_{loan_id}"
+        )
+
+        await update.message.reply_text(report_msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in show_report: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ خطا در ایجاد گزارش: {str(e)}")
 
 
 # ---- اکشن کلیک روی دکمه پرداخت ----
@@ -231,7 +291,6 @@ async def start_web_server(app: Application):
         return web.Response(text="OK")
 
     async def cron_reminder(request):
-        # بررسی اقساط ۳ روز آینده و یادآوری
         upcoming = await get_upcoming_unpaid(days_ahead=3)
         for inst in upcoming:
             loan = inst.get("loans")
@@ -263,13 +322,18 @@ async def start_web_server(app: Application):
     logger.info(f"Web server started on port {port}")
 
 
+async def post_init(application: Application):
+    """اجرای وب‌سرور همراه با شروع به کار ربات"""
+    asyncio.create_task(start_web_server(application))
+
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN not found!")
         return
 
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(post_init).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("new_loan", new_loan_start)],
@@ -282,18 +346,17 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    # ثبت تمامی دستورات و هندلرها
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("loans", list_loans))
+    application.add_handler(CommandHandler(["loans", "loan"], list_loans))
+    application.add_handler(CommandHandler("report", show_report))
+    application.add_handler(MessageHandler(filters.Regex(r"^/report_\d+$"), show_report))
     application.add_handler(CommandHandler("installments", show_installments))
     application.add_handler(MessageHandler(filters.Regex(r"^/installments_\d+$"), show_installments))
     application.add_handler(CallbackQueryHandler(pay_installment_callback, pattern=r"^pay:"))
     application.add_handler(conv_handler)
 
-    # شروع وب سرور و polling ربات
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(start_web_server(application))
-
+    # شروع ربات بدون مشکل لوپ
     application.run_polling()
 
 
