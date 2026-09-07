@@ -49,6 +49,13 @@ async def get_loans_by_user(user_id: int):
     return res.data or []
 
 
+async def get_active_loans(user_id: int):
+    res = await asyncio.to_thread(
+        lambda: supabase.table("loans").select("*").eq("user_id", user_id).neq("status", "settled").execute()
+    )
+    return res.data or []
+
+
 async def get_loan_by_id(loan_id: int):
     res = await asyncio.to_thread(lambda: supabase.table("loans").select("*").eq("id", loan_id).execute())
     return res.data[0] if res.data else None
@@ -63,12 +70,12 @@ async def get_installments_by_loan(loan_id: int):
 
 async def mark_installment_paid(installment_id: int, loan_id: int):
     now = datetime.utcnow().isoformat()
-    # 1. تغییر وضعیت قسط
+    # تغییر وضعیت قسط
     await asyncio.to_thread(
         lambda: supabase.table("installments").update({"paid": True, "paid_at": now}).eq("id", installment_id).execute()
     )
 
-    # 2. به‌روزرسانی تعداد اقساط پرداخت شده در جدول وام
+    # به‌روزرسانی تعداد اقساط پرداخت شده
     loan = await get_loan_by_id(loan_id)
     if loan:
         paid_count = loan.get("paid_installments", 0) + 1
