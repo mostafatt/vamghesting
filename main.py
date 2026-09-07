@@ -290,7 +290,8 @@ def main():
     application.add_handler(conv_handler)
 
     # شروع وب سرور و polling ربات
-    loop = asyncio.get_event_loop()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     loop.create_task(start_web_server(application))
 
     application.run_polling()
