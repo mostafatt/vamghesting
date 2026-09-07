@@ -1,89 +1,90 @@
 import os
-from typing import Any, Optional
+from supabase import create_client, Client
+from datetime import datetime, timedelta
 
-from supabase import acreate_client, AsyncClient
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
-SUPABASE_URL: str = os.environ["SUPABASE_URL"]
-SUPABASE_KEY: str = os.environ["SUPABASE_KEY"]
-
-_client: Optional[AsyncClient] = None
-
-
-async def _get_client() -> AsyncClient:
-    global _client
-    if _client is None:
-        _client = await acreate_client(SUPABASE_URL, SUPABASE_KEY)
-    return _client
+_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-# ── loans ─────────────────────────────────────────────────────────────────────
+async def add_loan(
+    borrower_name: str,
+    amount: float,
+    interest_rate: float,
+    duration: int,
+    installment_amount: float,
+) -> int:
+    data = {
+        "borrower_name": borrower_name,
+        "amount": amount,
+        "interest_rate": interest_rate,
+        "duration": duration,
+        "installment_amount": installment_amount,
+        "paid_installments": 0,
+        "status": "active",
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    result = _client.table("loans").insert(data).execute()
+    return result.data[0]["id"]
 
-async def add_loan(borrower: str, amount: int, description: str = "") -> dict[str, Any]:
-    client = await _get_client()
-    res = (
-        await client.table("loans")
-        .insert({"borrower": borrower, "amount": amount, "description": description, "settled": False})
-        .execute()
-    )
-    return res.data[0]
 
-
-async def get_active_loans() -> list[dict[str, Any]]:
-    client = await _get_client()
-    res = (
-        await client.table("loans")
+async def get_active_loans() -> list:
+    result = (
+        _client.table("loans")
         .select("*")
-        .eq("settled", False)
-        .order("created_at", desc=True)
+        .eq("status", "active")
+        .order("created_at", desc=False)
         .execute()
     )
-    return res.data
+    return result.data or []
 
 
-async def get_settled_loans() -> list[dict[str, Any]]:
-    client = await _get_client()
-    res = (
-        await client.table("loans")
+async def get_loan_by_id(loan_id: int) -> dict | None:
+    result = _client.table("loans").select("*").eq("id", loan_id).execute()
+    return result.data[0] if result.data else None
+
+
+async def add_installment(loan_id: int, amount: float) -> None:
+    # Insert installment record
+    _client.table("installments").insert(
+        {
+            "loan_id": loan_id,
+            "amount": amount,
+            "paid_at": datetime.utcnow().isoformat(),
+        }
+    ).execute()
+
+    # Increment paid_installments counter
+    loan = await get_loan_by_id(loan_id)
+    if loan:
+        _client.table("loans").update(
+            {"paid_installments": loan["paid_installments"] + 1}
+        ).eq("id", loan_id).execute()
+
+
+async def get_installments(loan_id: int) -> list:
+    result = (
+        _client.table("installments")
         .select("*")
-        .eq("settled", True)
-        .order("created_at", desc=True)
+        .eq("loan_id", loan_id)
+        .order("paid_at", desc=False)
         .execute()
     )
-    return res.data
+    return result.data or []
 
 
-async def get_loan_by_id(loan_id: int) -> Optional[dict[str, Any]]:
-    client = await _get_client()
-    res = (
-        await client.table("loans")
+async def close_loan(loan_id: int) -> None:
+    _client.table("loans").update({"status": "closed"}).eq("id", loan_id).execute()
+
+
+async def get_due_loans() -> list:
+    """Return active loans that still have unpaid installments."""
+    result = (
+        _client.table("loans")
         .select("*")
-        .eq("id", loan_id)
-        .single()
+        .eq("status", "active")
         .execute()
     )
-    return res.data
-
-
-async def settle_loan(loan_id: int) -> None:
-    client = await _get_client()
-    await (
-        client.table("loans")
-        .update({"settled": True, "settled_at": "now()"})
-        .eq("id", loan_id)
-        .execute()
-    )
-
-
-async def delete_loan(loan_id: int) -> None:
-    client = await _get_client()
-    await client.table("loans").delete().eq("id", loan_id).execute()
-
-
-async def update_loan_note(loan_id: int, note: str) -> None:
-    client = await _get_client()
-    await (
-        client.table("loans")
-        .update({"note": note})
-        .eq("id", loan_id)
-        .execute()
-    )
+    loans = result.data or []
+    return [l for l in loans if l["paid_installments"] < l["duration"]]
