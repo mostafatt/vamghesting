@@ -1,6 +1,7 @@
 import os
+import asyncio
+from datetime import datetime
 from supabase import create_client, Client
-from datetime import datetime, timedelta
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
@@ -25,13 +26,16 @@ async def add_loan(
         "status": "active",
         "created_at": datetime.utcnow().isoformat(),
     }
-    result = _client.table("loans").insert(data).execute()
-    return result.data[0]["id"]
+    # اجرای فراخوانی supabase در thread مجزا برای جلوگیری از بلاک شدن event loop
+    result = await asyncio.to_thread(lambda: _client.table("loans").insert(data).execute())
+    if result.data and len(result.data) > 0:
+        return result.data[0]["id"]
+    raise RuntimeError("خطا در درج وام در Supabase. داده‌ای برگشت داده نشد.")
 
 
 async def get_active_loans() -> list:
-    result = (
-        _client.table("loans")
+    result = await asyncio.to_thread(
+        lambda: _client.table("loans")
         .select("*")
         .eq("status", "active")
         .order("created_at", desc=False)
@@ -41,31 +45,41 @@ async def get_active_loans() -> list:
 
 
 async def get_loan_by_id(loan_id: int) -> dict | None:
-    result = _client.table("loans").select("*").eq("id", loan_id).execute()
+    result = await asyncio.to_thread(
+        lambda: _client.table("loans").select("*").eq("id", loan_id).execute()
+    )
     return result.data[0] if result.data else None
 
 
 async def add_installment(loan_id: int, amount: float) -> None:
-    # Insert installment record
-    _client.table("installments").insert(
-        {
-            "loan_id": loan_id,
-            "amount": amount,
-            "paid_at": datetime.utcnow().isoformat(),
-        }
-    ).execute()
+    # ثبت قسط پرداختی
+    await asyncio.to_thread(
+        lambda: _client.table("installments")
+        .insert(
+            {
+                "loan_id": loan_id,
+                "amount": amount,
+                "paid_at": datetime.utcnow().isoformat(),
+            }
+        )
+        .execute()
+    )
 
-    # Increment paid_installments counter
+    # افزایش شمارنده اقساط پرداخت شده
     loan = await get_loan_by_id(loan_id)
     if loan:
-        _client.table("loans").update(
-            {"paid_installments": loan["paid_installments"] + 1}
-        ).eq("id", loan_id).execute()
+        new_paid_count = loan.get("paid_installments", 0) + 1
+        await asyncio.to_thread(
+            lambda: _client.table("loans")
+            .update({"paid_installments": new_paid_count})
+            .eq("id", loan_id)
+            .execute()
+        )
 
 
 async def get_installments(loan_id: int) -> list:
-    result = (
-        _client.table("installments")
+    result = await asyncio.to_thread(
+        lambda: _client.table("installments")
         .select("*")
         .eq("loan_id", loan_id)
         .order("paid_at", desc=False)
@@ -75,16 +89,15 @@ async def get_installments(loan_id: int) -> list:
 
 
 async def close_loan(loan_id: int) -> None:
-    _client.table("loans").update({"status": "closed"}).eq("id", loan_id).execute()
+    await asyncio.to_thread(
+        lambda: _client.table("loans").update({"status": "closed"}).eq("id", loan_id).execute()
+    )
 
 
 async def get_due_loans() -> list:
-    """Return active loans that still have unpaid installments."""
-    result = (
-        _client.table("loans")
-        .select("*")
-        .eq("status", "active")
-        .execute()
+    """دریافت وام‌های فعالی که هنوز اقساط پرداخت‌نشده دارند."""
+    result = await asyncio.to_thread(
+        lambda: _client.table("loans").select("*").eq("status", "active").execute()
     )
     loans = result.data or []
-    return [l for l in loans if l["paid_installments"] < l["duration"]]
+    return [l for l in loans if l.get("paid_installments", 0) < l.get("duration", 0)]
