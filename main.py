@@ -178,24 +178,6 @@ async def get_reminder_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🆔 شناسه وام: {loan['id']}\n"
             f"👤 وام‌گیرنده: {borrower}\n"
             f"💰 مبلغ کل: {total_amount:,.0f} تومان\n"
-            f"💵 مبلغ هر قسط: {inst_amount:,.0❌ خطا در ثبت اطلاعات وام در دیتابیس.")
-            context.user_data.clear()
-            return ConversationHandler.END
-
-        # تولید جدول زمانی اقساط ۳۰ روزه
-        await create_schedule(
-            loan_id=loan["id"],
-            total_installments=count,
-            installment_amount=inst_amount,
-            start_date=first_due_date,
-            reminder_days=reminder_days,
-        )
-
-        success_text = (
-            f"✅ وام با موفقیت ثبت شد!\n\n"
-            f"🆔 شناسه وام: {loan['id']}\n"
-            f"👤 وام‌گیرنده: {borrower}\n"
-            f"💰 مبلغ کل: {total_amount:,.0f} تومان\n"
             f"💵 مبلغ هر قسط: {inst_amount:,.0f} تومان\n"
             f"🔢 تعداد اقساط: {count} ماهه\n"
             f"📅 سررسید اولین قسط: {first_due_date.isoformat()}\n"
@@ -225,7 +207,21 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- مشاهده و مدیریت وام‌ها ---------------- #
 
-async def list_} تومان\n"
+async def list_loans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    loans = await get_active_loans(user_id)
+
+    if not loans:
+        await update.message.reply_text("📌 شما هیچ وام فعالی ندارید.")
+        return
+
+    text = "📋 لیست وام‌های فعال شما:\n\n"
+    for l in loans:
+        paid = l.get("paid_installments", 0)
+        total = l.get("total_installments", 0)
+        text += (
+            f"🔹 وام #{l['id']}: {l.get('borrower_name', '-')}\n"
+            f"💰 مبلغ قسط: {l.get('installment_amount', 0):,.0f} تومان\n"
             f"📊 وضعیت پرداخت: {paid} از {total} قسط\n"
             f"🔍 مشاهده اقساط: /installments_{l['id']}\n\n"
         )
